@@ -8,23 +8,17 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 app = FastAPI()
 
-# Railway Variables
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")              # xoxb-...
-SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")    # from Slack App settings
-DEFAULT_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")          # optional fallback
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")    # from Slack App -> Basic Information
+DEFAULT_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")          # for cron job / manual tests
 
 
 # ----------------------------
-# Slack Security Verification
+# Slack signature verification
 # ----------------------------
 def verify_slack_signature(request: Request, raw_body: bytes):
-    """
-    Verifies Slack request signature using Signing Secret.
-    Required to avoid fake requests hitting your endpoint.
-    """
     if not SLACK_SIGNING_SECRET:
-        # If you didn't set signing secret, we skip verification
-        # (Not recommended for production)
+        # Not recommended for production, but allowed for testing
         return
 
     timestamp = request.headers.get("X-Slack-Request-Timestamp")
@@ -33,7 +27,7 @@ def verify_slack_signature(request: Request, raw_body: bytes):
     if not timestamp or not slack_signature:
         raise HTTPException(status_code=401, detail="Missing Slack signature headers")
 
-    # prevent replay attacks (5 minutes window)
+    # prevent replay attack
     if abs(time.time() - int(timestamp)) > 60 * 5:
         raise HTTPException(status_code=401, detail="Slack request too old")
 
@@ -52,7 +46,7 @@ def verify_slack_signature(request: Request, raw_body: bytes):
 
 
 # ----------------------------
-# Slack Message Sender
+# Slack API helper
 # ----------------------------
 def post_message(channel_id: str, text: str):
     if not SLACK_BOT_TOKEN:
@@ -79,21 +73,52 @@ async def home():
     return {"status": "ok", "message": "Slack bot running"}
 
 
-# Manual endpoint trigger (for testing)
-@app.post("/gm")
-async def greet():
+# For browser test:
+# GET https://yourapp.up.railway.app/greet
+@app.get("/greet")
+async def greet_get():
     if not DEFAULT_CHANNEL_ID:
         return JSONResponse(
             {"ok": False, "error": "Missing SLACK_CHANNEL_ID variable"},
             status_code=500,
         )
 
-    text = "Good morning everyone ☀️"
-    data = post_message(DEFAULT_CHANNEL_ID, text)
+    msg = "Good morning everyone ☀️"
+    data = post_message(DEFAULT_CHANNEL_ID, msg)
     return {"ok": True, "sent": True, "slack": data}
 
 
-# Slack Events API endpoint
+# Slash command handler:
+# In Slack App -> Slash Commands:
+# Command: /greet
+# Request URL: https://yourapp.up.railway.app/greet
+@app.post("/greet")
+async def greet_slash_command(request: Request):
+    raw = await request.body()
+    verify_slack_signature(request, raw)
+
+    form = await request.form()
+
+    # Slack sends form-encoded data
+    user_id = form.get("user_id")           # Uxxxx
+    user_name = form.get("user_name")       # e.g. bishwo
+    channel_id = form.get("channel_id")     # Cxxxx
+    text_arg = (form.get("text") or "").strip()  # /greet hello
+
+    # build message
+    if text_arg:
+        msg = f"☀️ {text_arg}\n— from <@{user_id}>"
+    else:
+        msg = f"Good morning everyone ☀️\n— from <@{user_id}>"
+
+    # post into same channel where command used
+    post_message(channel_id, msg)
+
+    # reply to the command request (private confirmation)
+    return PlainTextResponse(f"✅ Greeting sent by @{user_name}", status_code=200)
+
+
+# Optional Slack events endpoint (only needed if you use Events API)
 @app.post("/slack/events")
 async def slack_events(request: Request):
     raw = await request.body()
@@ -101,45 +126,8 @@ async def slack_events(request: Request):
 
     data = await request.json()
 
-    # Slack URL verification challenge
     if data.get("type") == "url_verification":
         return JSONResponse({"challenge": data.get("challenge")})
 
-    # You can handle events here if you want
-    # example: print
     print("EVENT:", data)
-
     return JSONResponse({"ok": True})
-
-
-# Slash command endpoint
-# In Slack App -> Slash Commands -> Request URL:
-# https://your-domain.up.railway.app/slack/commands
-@app.post("/slack/commands")
-async def slack_commands(request: Request):
-    raw = await request.body()
-    verify_slack_signature(request, raw)
-
-    form = await request.form()
-
-    command = form.get("command")            # "/gm"
-    user_id = form.get("user_id")            # Uxxxx
-    user_name = form.get("user_name")        # "bishwo"
-    channel_id = form.get("channel_id")      # Cxxxx
-    text_arg = (form.get("text") or "").strip()  # optional args after command
-
-    if command != "/gm":
-        return PlainTextResponse("Unknown command", status_code=200)
-
-    # Customize message
-    # You can do: /gm hello -> sends hello
-    if text_arg:
-        msg = f"☀️ {text_arg}\n— from <@{user_id}>"
-    else:
-        msg = f"Good morning everyone ☀️\n— from <@{user_id}>"
-
-    # post in same channel user typed command
-    post_message(channel_id, msg)
-
-    # reply privately to user (ephemeral)
-    return PlainTextResponse(f"✅ Sent greeting to channel as requested by @{user_name}", status_code=200)
