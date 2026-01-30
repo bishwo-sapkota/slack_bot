@@ -1,7 +1,12 @@
-from fastapi import FastAPI, Request
+import os
+import requests
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
+
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
 
 @app.get("/")
 async def home():
@@ -9,14 +14,19 @@ async def home():
 
 @app.get("/greet")
 async def greet():
-    return {"message": "Good morning everyone"}
+    text = "Good morning everyone ☀️"
 
-@app.post("/slack/events")
-async def slack_events(request: Request):
-    data = await request.json()
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        return JSONResponse(
+            {"ok": False, "error": "Missing SLACK_BOT_TOKEN or SLACK_CHANNEL_ID"},
+            status_code=500
+        )
 
-    if data.get("type") == "url_verification":
-        return JSONResponse({"challenge": data.get("challenge")})
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    payload = {"channel": SLACK_CHANNEL_ID, "text": text}
 
-    print("Slack Event:", data)
-    return JSONResponse({"ok": True})
+    r = requests.post(url, headers=headers, json=payload)
+    data = r.json()
+
+    return {"ok": data.get("ok"), "slack_response": data}
