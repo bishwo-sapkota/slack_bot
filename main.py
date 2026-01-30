@@ -80,7 +80,7 @@ async def home():
 
 
 # Manual endpoint trigger (for testing)
-@app.get("/greet")
+@app.post("/gm")
 async def greet():
     if not DEFAULT_CHANNEL_ID:
         return JSONResponse(
@@ -122,17 +122,17 @@ async def slack_commands(request: Request):
 
     form = await request.form()
 
-    command = form.get("command")            # "/greet"
+    command = form.get("command")            # "/gm"
     user_id = form.get("user_id")            # Uxxxx
     user_name = form.get("user_name")        # "bishwo"
     channel_id = form.get("channel_id")      # Cxxxx
     text_arg = (form.get("text") or "").strip()  # optional args after command
 
-    if command != "/greet":
+    if command != "/gm":
         return PlainTextResponse("Unknown command", status_code=200)
 
     # Customize message
-    # You can do: /greet hello -> sends hello
+    # You can do: /gm hello -> sends hello
     if text_arg:
         msg = f"☀️ {text_arg}\n— from <@{user_id}>"
     else:
