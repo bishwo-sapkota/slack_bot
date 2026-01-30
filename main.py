@@ -12,7 +12,7 @@ SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
 async def home():
     return {"status": "ok", "message": "Slack bot running"}
 
-@app.get("/greet")
+@app.post("/greet")
 async def greet():
     text = "Good morning everyone ☀️"
 
