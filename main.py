@@ -2,15 +2,30 @@ import os
 import time
 import hmac
 import hashlib
+import urllib.parse
 import requests
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+
+from db import init_db, save_user_token, get_user_token
 
 app = FastAPI()
 
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")              # xoxb-...
-SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")    # from Slack App -> Basic Information
-DEFAULT_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")          # for cron job / manual tests
+SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
+SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+APP_BASE_URL = os.getenv("APP_BASE_URL")  # https://xxxx.up.railway.app
+
+if not APP_BASE_URL:
+    APP_BASE_URL = ""
+
+
+# ----------------------------
+# Startup
+# ----------------------------
+@app.on_event("startup")
+def startup():
+    init_db()
 
 
 # ----------------------------
@@ -18,8 +33,7 @@ DEFAULT_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")          # for cron job / man
 # ----------------------------
 def verify_slack_signature(request: Request, raw_body: bytes):
     if not SLACK_SIGNING_SECRET:
-        # Not recommended for production, but allowed for testing
-        return
+        raise HTTPException(status_code=500, detail="Missing SLACK_SIGNING_SECRET")
 
     timestamp = request.headers.get("X-Slack-Request-Timestamp")
     slack_signature = request.headers.get("X-Slack-Signature")
@@ -27,7 +41,7 @@ def verify_slack_signature(request: Request, raw_body: bytes):
     if not timestamp or not slack_signature:
         raise HTTPException(status_code=401, detail="Missing Slack signature headers")
 
-    # prevent replay attack
+    # Replay protection
     if abs(time.time() - int(timestamp)) > 60 * 5:
         raise HTTPException(status_code=401, detail="Slack request too old")
 
@@ -46,14 +60,11 @@ def verify_slack_signature(request: Request, raw_body: bytes):
 
 
 # ----------------------------
-# Slack API helper
+# Helpers
 # ----------------------------
-def post_message(channel_id: str, text: str):
-    if not SLACK_BOT_TOKEN:
-        raise Exception("Missing SLACK_BOT_TOKEN")
-
+def slack_post_as_user(user_token: str, channel_id: str, text: str):
     url = "https://slack.com/api/chat.postMessage"
-    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    headers = {"Authorization": f"Bearer {user_token}"}
     payload = {"channel": channel_id, "text": text}
 
     r = requests.post(url, headers=headers, json=payload, timeout=20)
@@ -73,25 +84,93 @@ async def home():
     return {"status": "ok", "message": "Slack bot running"}
 
 
-# For browser test:
-# GET https://yourapp.up.railway.app/greet
-@app.get("/greet")
-async def greet_get():
-    if not DEFAULT_CHANNEL_ID:
-        return JSONResponse(
-            {"ok": False, "error": "Missing SLACK_CHANNEL_ID variable"},
-            status_code=500,
-        )
+# ----------------------------
+# Install button page
+# ----------------------------
+@app.get("/slack/install")
+async def slack_install():
+    """
+    User opens this link, clicks install, authorizes app.
+    """
+    if not SLACK_CLIENT_ID or not APP_BASE_URL:
+        return PlainTextResponse("Missing SLACK_CLIENT_ID or APP_BASE_URL", status_code=500)
 
-    msg = "Good morning everyone ☀️"
-    data = post_message(DEFAULT_CHANNEL_ID, msg)
-    return {"ok": True, "sent": True, "slack": data}
+    redirect_uri = f"{APP_BASE_URL}/slack/oauth_redirect"
+
+    params = {
+        "client_id": SLACK_CLIENT_ID,
+        "scope": "",  # bot scopes not needed for this approach
+        "user_scope": "chat:write",
+        "redirect_uri": redirect_uri,
+    }
+
+    install_url = "https://slack.com/oauth/v2/authorize?" + urllib.parse.urlencode(params)
+
+    html = f"""
+    <html>
+      <body style="font-family:Arial;padding:30px;">
+        <h2>Install Slack Greeting App</h2>
+        <p>Click below to authorize. This allows the app to post messages as YOU.</p>
+        <a href="{install_url}" style="display:inline-block;padding:12px 18px;background:#4A154B;color:white;text-decoration:none;border-radius:8px;">
+          Authorize Slack
+        </a>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
 
 
-# Slash command handler:
-# In Slack App -> Slash Commands:
-# Command: /greet
-# Request URL: https://yourapp.up.railway.app/greet
+# ----------------------------
+# OAuth Redirect
+# ----------------------------
+@app.get("/slack/oauth_redirect")
+async def slack_oauth_redirect(code: str = None, error: str = None):
+    if error:
+        return HTMLResponse(f"<h3>OAuth failed: {error}</h3>")
+
+    if not code:
+        return HTMLResponse("<h3>Missing code</h3>", status_code=400)
+
+    if not SLACK_CLIENT_ID or not SLACK_CLIENT_SECRET or not APP_BASE_URL:
+        return HTMLResponse("<h3>Server missing Slack OAuth env vars</h3>", status_code=500)
+
+    redirect_uri = f"{APP_BASE_URL}/slack/oauth_redirect"
+
+    # Exchange code for token
+    token_url = "https://slack.com/api/oauth.v2.access"
+    payload = {
+        "client_id": SLACK_CLIENT_ID,
+        "client_secret": SLACK_CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+
+    r = requests.post(token_url, data=payload, timeout=20)
+    data = r.json()
+
+    if not data.get("ok"):
+        return HTMLResponse(f"<pre>OAuth error: {data}</pre>", status_code=400)
+
+    # This is the IMPORTANT part: user token
+    authed_user = data.get("authed_user", {})
+    user_id = authed_user.get("id")
+    user_token = authed_user.get("access_token")
+
+    if not user_id or not user_token:
+        return HTMLResponse(f"<pre>Missing authed_user token: {data}</pre>", status_code=400)
+
+    save_user_token(user_id, user_token)
+
+    return HTMLResponse("""
+        <h2>✅ Authorized Successfully</h2>
+        <p>You can now use <b>/greet</b> in Slack and it will post as YOU.</p>
+    """)
+
+
+# ----------------------------
+# Slash Command endpoint
+# Request URL for /greet -> https://YOURAPP.up.railway.app/greet
+# ----------------------------
 @app.post("/greet")
 async def greet_slash_command(request: Request):
     raw = await request.body()
@@ -99,35 +178,25 @@ async def greet_slash_command(request: Request):
 
     form = await request.form()
 
-    # Slack sends form-encoded data
-    user_id = form.get("user_id")           # Uxxxx
-    user_name = form.get("user_name")       # e.g. bishwo
-    channel_id = form.get("channel_id")     # Cxxxx
-    text_arg = (form.get("text") or "").strip()  # /greet hello
+    user_id = form.get("user_id")
+    channel_id = form.get("channel_id")
+    text_arg = (form.get("text") or "").strip()
 
-    # build message
-    if text_arg:
-        msg = f"☀️ {text_arg}\n— from <@{user_id}>"
-    else:
-        msg = f"Good morning everyone ☀️\n— from <@{user_id}>"
+    if not user_id or not channel_id:
+        return PlainTextResponse("Invalid request", status_code=400)
 
-    # post into same channel where command used
-    post_message(channel_id, msg)
+    # get token for THIS user
+    user_token = get_user_token(user_id)
+    if not user_token:
+        # send install link to that user
+        return PlainTextResponse(
+            f"❌ You are not authorized.\nPlease open: {APP_BASE_URL}/slack/install",
+            status_code=200,
+        )
 
-    # reply to the command request (private confirmation)
-    return PlainTextResponse(f"✅ Greeting sent by @{user_name}", status_code=200)
+    msg = text_arg if text_arg else "Good morning everyone ☀️"
 
+    # post as the actual user
+    slack_post_as_user(user_token, channel_id, msg)
 
-# Optional Slack events endpoint (only needed if you use Events API)
-@app.post("/slack/events")
-async def slack_events(request: Request):
-    raw = await request.body()
-    verify_slack_signature(request, raw)
-
-    data = await request.json()
-
-    if data.get("type") == "url_verification":
-        return JSONResponse({"challenge": data.get("challenge")})
-
-    print("EVENT:", data)
-    return JSONResponse({"ok": True})
+    return PlainTextResponse("✅ Sent!", status_code=200)
